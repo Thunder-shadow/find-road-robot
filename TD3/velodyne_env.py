@@ -439,3 +439,17 @@ class GazeboEnv:
         else:
             r3 = lambda x: 1 - x if x < 1 else 0.0
             return action[0] / 2 - abs(action[1]) / 2 - r3(min_laser) / 2
+
+    def get_pose(self):
+        # 返回机器人当前位姿(x, y, heading_angle)
+        if self.last_odom is None:
+            return self.odom_x, self.odom_y, 0.0
+        quaternion = Quaternion(
+            self.last_odom.pose.pose.orientation.w,
+            self.last_odom.pose.pose.orientation.x,
+            self.last_odom.pose.pose.orientation.y,
+            self.last_odom.pose.pose.orientation.z,
+        )
+        euler = quaternion.to_euler(degrees=False)
+        angle = round(euler[2], 4)
+        return self.odom_x, self.odom_y, angle

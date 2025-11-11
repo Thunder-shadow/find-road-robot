@@ -1,5 +1,7 @@
 import os
 import time
+import math
+import random
 
 import numpy as np
 import torch
@@ -7,9 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from numpy import inf
 from torch.utils.tensorboard import SummaryWriter
+from squaternion import Quaternion
 
 from replay_buffer import ReplayBuffer
-from velodyne_env import GazeboEnv
+from velodyne_env import GazeboEnv, check_pos
 
 
 def evaluate(network, epoch, eval_episodes=10):
@@ -240,38 +243,214 @@ save_model = True  # Weather to save the model or not
 load_model = False  # Weather to load a stored model
 random_near_obstacle = True  # To take random actions near obstacles or not
 
-# Create the network storage folders
-if not os.path.exists("./results"):
-    os.makedirs("./results")
-if save_model and not os.path.exists("./pytorch_models"):
-    os.makedirs("./pytorch_models")
+# 顶部插入：开关、A*（带缓存）、角误差计算、DuelingDQN与混合训练器
+USE_HYBRID = True
 
-# Create the training environment
-environment_dim = 20
-robot_dim = 4
-env = GazeboEnv("multi_robot_scenario.launch", environment_dim)
-time.sleep(5)
-torch.manual_seed(seed)
-np.random.seed(seed)
-state_dim = environment_dim + robot_dim
-action_dim = 2
-max_action = 1
+class AStarPlanner:
+    def __init__(self, world_min=-4.5, world_max=4.5, grid_size=50, cache_file="gazebo_path_cache.pkl"):
+        self.world_min = world_min
+        self.world_max = world_max
+        self.grid_size = grid_size
+        self.cache_file = cache_file
+        self.occupancy = self._build_occupancy()
+        self.cache = {}
+        self._load_cache()
 
-# Create the network
-network = TD3(state_dim, action_dim, max_action)
-# Create a replay buffer
-replay_buffer = ReplayBuffer(buffer_size, seed)
-if load_model:
-    try:
-        network.load(file_name, "./pytorch_models")
-    except:
-        print(
-            "Could not load the stored model parameters, initializing training with random parameters"
-        )
+    def _build_occupancy(self):
+        occ = [[1 for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        cell = (self.world_max - self.world_min) / self.grid_size
+        for ix in range(self.grid_size):
+            for iy in range(self.grid_size):
+                cx = self.world_min + (ix + 0.5) * cell
+                cy = self.world_min + (iy + 0.5) * cell
+                occ[ix][iy] = 0 if not check_pos(cx, cy) else 1
+        return occ
 
-# Create evaluation data store
-evaluations = []
+    def world_to_grid(self, x, y):
+        cell = (self.world_max - self.world_min) / self.grid_size
+        ix = int((x - self.world_min) / cell)
+        iy = int((y - self.world_min) / cell)
+        ix = max(0, min(self.grid_size - 1, ix))
+        iy = max(0, min(self.grid_size - 1, iy))
+        return ix, iy
 
+    def grid_to_world(self, ix, iy):
+        cell = (self.world_max - self.world_min) / self.grid_size
+        cx = self.world_min + (ix + 0.5) * cell
+        cy = self.world_min + (iy + 0.5) * cell
+        return cx, cy
+
+    def neighbors(self, ix, iy):
+        for dx, dy in [(0,1),(1,0),(0,-1),(-1,0)]:
+            nx, ny = ix + dx, iy + dy
+            if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size and self.occupancy[nx][ny] == 1:
+                yield nx, ny
+
+    def heuristic(self, a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def _cache_key(self, sx, sy, gx, gy):
+        return (sx, sy, gx, gy)
+
+    def _load_cache(self):
+        try:
+            import pickle, os
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, "rb") as f:
+                    self.cache = pickle.load(f)
+                print(f"Path cache loaded from {self.cache_file}")
+        except Exception as e:
+            print(f"Path cache load failed: {e}")
+
+    def save_cache(self):
+        try:
+            import pickle
+            with open(self.cache_file, "wb") as f:
+                pickle.dump(self.cache, f)
+            print(f"Path cache saved to {self.cache_file}")
+        except Exception as e:
+            print(f"Path cache save failed: {e}")
+
+    def plan(self, start_w, goal_w):
+        import heapq
+        sx, sy = self.world_to_grid(start_w[0], start_w[1])
+        gx, gy = self.world_to_grid(goal_w[0], goal_w[1])
+        key = self._cache_key(sx, sy, gx, gy)
+        if key in self.cache:
+            return [self.grid_to_world(ix, iy) for ix, iy in self.cache[key]]
+        start = (sx, sy); goal = (gx, gy)
+        oheap = []
+        heapq.heappush(oheap, (self.heuristic(start, goal), start))
+        came_from = {}; gscore = {start: 0}; fscore = {start: self.heuristic(start, goal)}
+        closed = set()
+        while oheap:
+            _, cur = heapq.heappop(oheap)
+            if cur == goal:
+                path = []
+                while cur in came_from:
+                    path.append(cur); cur = came_from[cur]
+                path.append(start); path.reverse()
+                self.cache[key] = path
+                return [self.grid_to_world(ix, iy) for ix, iy in path]
+            closed.add(cur)
+            for nxt in self.neighbors(cur[0], cur[1]):
+                tentative = gscore[cur] + 1
+                if nxt in closed and tentative >= gscore.get(nxt, 1e9): continue
+                if tentative < gscore.get(nxt, 1e9):
+                    came_from[nxt] = cur
+                    gscore[nxt] = tentative
+                    fscore[nxt] = tentative + self.heuristic(nxt, goal)
+                    heapq.heappush(oheap, (fscore[nxt], nxt))
+        return []
+
+def compute_theta_to_waypoint(px, py, heading, wx, wy):
+    skew_x = wx - px; skew_y = wy - py
+    dot = skew_x * 1 + skew_y * 0
+    mag1 = math.sqrt(skew_x ** 2 + skew_y ** 2)
+    if mag1 < 1e-6: return 0.0
+    beta = math.acos(dot / mag1)
+    if skew_y < 0: beta = -beta if skew_x < 0 else -beta
+    theta = beta - heading
+    if theta > math.pi:
+        theta = math.pi - theta; theta = -math.pi - theta
+    if theta < -math.pi:
+        theta = -math.pi - theta; theta = math.pi - theta
+    return theta
+
+class DuelingDQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DuelingDQN, self).__init__()
+        self.feature = nn.Sequential(nn.Linear(state_size, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU())
+        self.val = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 1))
+        self.adv = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, action_size))
+    def forward(self, s):
+        f = self.feature(s)
+        v = self.val(f)
+        a = self.adv(f)
+        return v + (a - a.mean(dim=1, keepdim=True))
+
+class HybridDQNTrainer:
+    def __init__(self, state_size, action_size, device, lr=5e-4, gamma=0.99, epsilon=1.0, epsilon_min=0.01, epsilon_decay=0.9995, tau=0.005, heuristic_weight=1.5):
+        self.device = device
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.tau = tau
+        self.heuristic_weight = heuristic_weight
+        self.batch_size = 128
+        self.update_every = 4
+        self.learn_step = 0
+        self.memory = []
+        self.max_mem = 100000
+        self.model = DuelingDQN(state_size, action_size).to(device)
+        self.target = DuelingDQN(state_size, action_size).to(device)
+        self.target.load_state_dict(self.model.state_dict())
+        self.opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        self.crit = nn.SmoothL1Loss()
+        self.action_map = {
+            0: (0.6, 0.0),
+            1: (0.0, 0.8),
+            2: (0.0, -0.8),
+            3: (0.5, 0.5),
+            4: (0.5, -0.5),
+        }
+    def save(self, filename="pytorch_models/hybrid_dqn_latest.pth"):
+        try:
+            torch.save({"model_state_dict": self.model.state_dict()}, filename)
+            print(f"Hybrid DQN saved to {filename}")
+        except Exception as e:
+            print(f"Hybrid DQN save failed: {e}")
+    def load(self, filename="pytorch_models/hybrid_dqn_latest.pth"):
+        try:
+            state = torch.load(filename, map_location=self.device)
+            self.model.load_state_dict(state["model_state_dict"])
+            self.target.load_state_dict(self.model.state_dict())
+            print(f"Hybrid DQN loaded from {filename}")
+            return True
+        except Exception as e:
+            print(f"Hybrid DQN load failed: {e}")
+            return False
+    def act(self, state, theta_wp):
+        if np.random.rand() < self.epsilon:
+            action_idx = np.random.randint(0, len(self.action_map))
+        else:
+            s = torch.FloatTensor(np.array(state).reshape(1, -1)).to(self.device)
+            with torch.no_grad():
+                q = self.model(s).cpu().numpy()[0]
+            heuristic = np.zeros(len(self.action_map))
+            if abs(theta_wp) < 0.3: heuristic[0] = 1.0
+            if theta_wp > 0.2: heuristic[1] = 1.0; heuristic[3] = 1.0
+            if theta_wp < -0.2: heuristic[2] = 1.0; heuristic[4] = 1.0
+            combined = q + self.heuristic_weight * heuristic
+            action_idx = int(np.argmax(combined))
+        lin, ang = self.action_map[action_idx]
+        return [max(0.0, min(1.0, lin)), max(-1.0, min(1.0, ang))], action_idx
+    def remember(self, s, a_idx, r, s2, done):
+        if len(self.memory) >= self.max_mem: self.memory.pop(0)
+        self.memory.append((s, a_idx, r, s2, done))
+    def replay(self):
+        self.learn_step += 1
+        if len(self.memory) < self.batch_size or self.learn_step % self.update_every != 0:
+            return
+        batch = random.sample(self.memory, self.batch_size)
+        states = torch.FloatTensor(np.array([t[0] for t in batch])).to(self.device)
+        actions = torch.LongTensor(np.array([t[1] for t in batch])).to(self.device)
+        rewards = torch.FloatTensor(np.array([t[2] for t in batch])).to(self.device)
+        next_states = torch.FloatTensor(np.array([t[3] for t in batch])).to(self.device)
+        dones = torch.FloatTensor(np.array([t[4] for t in batch])).to(self.device)
+        with torch.no_grad():
+            next_actions = self.model(next_states).argmax(1)
+            next_q = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze()
+            target_q = rewards + (1 - dones) * self.gamma * next_q
+        current_q = self.model(states).gather(1, actions.unsqueeze(1)).squeeze()
+        loss = self.crit(current_q, target_q)
+        self.opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
+        self.opt.step()
+        for tp, p in zip(self.target.parameters(), self.model.parameters()):
+            tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+        if self.epsilon > self.epsilon_min: self.epsilon *= self.epsilon_decay
 timestep = 0
 timesteps_since_eval = 0
 episode_num = 0
@@ -287,17 +466,34 @@ while timestep < max_timesteps:
     # On termination of episode
     if done:
         if timestep != 0:
-            network.train(
-                replay_buffer,
-                episode_timesteps,
-                batch_size,
-                discount,
-                tau,
-                policy_noise,
-                noise_clip,
-                policy_freq,
-            )
-
+            # 记录上一个episode的奖励并更新计数
+            prev_episode_reward = episode_reward
+            episodes_completed += 1
+            # 定期保存模型
+            if (e + 1) % save_interval == 0:
+                if USE_HYBRID:
+                    hybrid_trainer.save("pytorch_models/hybrid_dqn_latest.pth")
+                    try:
+                        best_reward
+                    except NameError:
+                        best_reward = -np.inf
+                    if total_reward > best_reward:
+                        best_reward = total_reward
+                        hybrid_trainer.save("pytorch_models/hybrid_dqn_best.pth")
+                        planner.save_cache()
+                    else:
+                        network.save(f'{"TD3_velodyne"}', directory="./pytorch_models")
+            if not USE_HYBRID:
+                network.train(
+                    replay_buffer,
+                    episode_timesteps,
+                    batch_size,
+                    discount,
+                    tau,
+                    policy_noise,
+                    noise_clip,
+                    policy_freq,
+                )
         if timesteps_since_eval >= eval_freq:
             print("Validating")
             timesteps_since_eval %= eval_freq
@@ -319,37 +515,52 @@ while timestep < max_timesteps:
     if expl_noise > expl_min:
         expl_noise = expl_noise - ((1 - expl_min) / expl_decay_steps)
 
-    action = network.get_action(np.array(state))
-    action = (action + np.random.normal(0, expl_noise, size=action_dim)).clip(
-        -max_action, max_action
-    )
+    if USE_HYBRID:
+        # 训练主循环中的动作选择与更新（加入混合分支）
+        try:
+            hybrid_trainer
+        except NameError:
+            hybrid_trainer = HybridDQNTrainer(state_size=state_dim, action_size=5, device=device, heuristic_weight=1.5)
+            planner = AStarPlanner(world_min=-4.5, world_max=4.5, grid_size=50, cache_file="gazebo_path_cache.pkl")
+            path = []; path_idx = 0
+            hybrid_trainer.load("pytorch_models/hybrid_dqn_latest.pth")
 
-    # If the robot is facing an obstacle, randomly force it to take a consistent random action.
-    # This is done to increase exploration in situations near obstacles.
-    # Training can also be performed without it
-    if random_near_obstacle:
-        if (
-            np.random.uniform(0, 1) > 0.85
-            and min(state[4:-8]) < 0.6
-            and count_rand_actions < 1
-        ):
-            count_rand_actions = np.random.randint(8, 15)
-            random_action = np.random.uniform(-1, 1, 2)
+        # 读取位姿与目标
+        if env.last_odom is not None:
+            q = env.last_odom.pose.pose.orientation
+            from squaternion import Quaternion
+            heading = round(Quaternion(q.w, q.x, q.y, q.z).to_euler(degrees=False)[2], 4)
+        else:
+            heading = 0.0
+        px, py = env.odom_x, env.odom_y
+        gx, gy = env.goal_x, env.goal_y
 
-        if count_rand_actions > 0:
-            count_rand_actions -= 1
-            action = random_action
-            action[0] = -1
+        # 路径规划推进
+        if not path or path_idx >= len(path):
+            path = planner.plan((px, py), (gx, gy)); path_idx = 0
+        if not path:
+            wx, wy = gx, gy
+        else:
+            wx, wy = path[min(path_idx, len(path) - 1)]
+            if math.hypot(px - wx, py - wy) < 0.2 and path_idx < len(path) - 1:
+                path_idx += 1; wx, wy = path[path_idx]
 
-    # Update action to fall in range [0,1] for linear velocity and [-1,1] for angular velocity
-    a_in = [(action[0] + 1) / 2, action[1]]
+        theta_wp = compute_theta_to_waypoint(px, py, heading, wx, wy)
+        a_in, a_idx = hybrid_trainer.act(state, theta_wp)
+    else:
+        action = network.get_action(np.array(state))
+        a_in = [(action[0] + 1) / 2, action[1]]
+
     next_state, reward, done, target = env.step(a_in)
     done_bool = 0 if episode_timesteps + 1 == max_ep else int(done)
     done = 1 if episode_timesteps + 1 == max_ep else int(done)
     episode_reward += reward
 
-    # Save the tuple in replay buffer
-    replay_buffer.add(state, action, reward, done_bool, next_state)
+    if USE_HYBRID:
+        hybrid_trainer.remember(state, a_idx, reward, next_state, done_bool)
+        hybrid_trainer.replay()
+    else:
+        replay_buffer.add(state, action, reward, done_bool, next_state)
 
     # Update the counters
     state = next_state
@@ -357,8 +568,27 @@ while timestep < max_timesteps:
     timestep += 1
     timesteps_since_eval += 1
 
-# After the training is done, evaluate the network and save it
+# 训练结束后保存模型与路径缓存
+if save_model:
+    if USE_HYBRID:
+        try:
+            hybrid_trainer.save("pytorch_models/hybrid_dqn_final.pth")
+        except Exception:
+            pass
+        try:
+            planner.save_cache()
+        except Exception:
+            pass
+    else:
+        try:
+            network.save("%s" % file_name, directory="./pytorch_models")
+        except Exception:
+            pass
 evaluations.append(evaluate(network=network, epoch=epoch, eval_episodes=eval_ep))
 if save_model:
-    network.save("%s" % file_name, directory="./pytorch_models")
+    if USE_HYBRID:
+        hybrid_trainer.save("pytorch_models/hybrid_dqn_final.pth")
+        planner.save_cache()
+    else:
+        network.save("%s" % file_name, directory="./pytorch_models")
 np.save("./results/%s" % file_name, evaluations)
