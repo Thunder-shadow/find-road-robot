@@ -7,7 +7,7 @@
     <!-- 加载机器人（复用 pioneer3dx.gazebo.launch，但确保它不启动 Gazebo） -->
     <include file="$(find multi_robot_scenario)/launch/pioneer3dx.gazebo.launch">
         <arg name="robot_name" value="p3dx" />
-        <arg name="robot_position" value="-x 0.0 -y 0.0 -z 0.01 -R 0 -P 0 -Y +0.0" />
+        <arg name="robot_position" value="-x -8.0 -y 8.0 -z 0.05 -R 0 -P 0 -Y +0.0" />
     </include>
 
     <!-- 启动 RVIZ -->

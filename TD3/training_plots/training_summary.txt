@@ -1,0 +1,7 @@
+Training Summary Report
+==================================================
+Total Episodes: 14
+Total Training Time: 250.9 seconds
+Average Reward: 17.34
+Success Rate: 42.9%
+Final Exploration Rate: 0.162
